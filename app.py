@@ -1,3 +1,4 @@
+# app.py
 import io
 import json
 import zipfile
@@ -18,16 +19,16 @@ except Exception:
     DBF_AVAILABLE = False
 
 st.set_page_config(page_title="DBF → JSON (Daily Close Prices)", layout="wide")
-st.title("📦➡️🧾 DBF (CPyyyymmdd) → JSON Converter — Multi-file")
+st.title("📦➡️🧾 DBF (CPyyyymmdd / CPyymmdd) → JSON Converter — Multi-file")
 
 st.markdown(
     """
 Upload **one or more** files (`.dbf` and/or `.zip` containing `.dbf`).
-The app will parse daily close prices and export **JSON**.
+The app parses your **daily closing prices** and exports **JSON**.
 
 **Assumptions:**
-- Each daily file is named `CPyyyymmdd.dbf` (date from filename)
-- Each DBF contains exactly **two columns**: stock **code**, **close**
+- Filenames are `CPyyyymmdd.dbf` **or** `CPyymmdd.dbf` (date from filename)
+- Each DBF has exactly **two columns**: stock **code**, **close**
 - Codes are normalized (trim + uppercase), prices to numeric
 """
 )
@@ -36,29 +37,37 @@ if not DBF_AVAILABLE:
     st.warning(
         "Python package **dbfread** is not installed. "
         "Please install it first:\n\n"
-        "```bash\npip install dbfread\n```"
+        "```bash\\npip install dbfread\\n```"
     )
 
 # ----------------- Helpers -----------------
 def parse_cp_date_from_name(name: str) -> pd.Timestamp:
     """
-    Robustly parse date from filenames.
-    Preferred: CPyyyyMMdd.*  (e.g., CP20250925.dbf)
-    Also tolerates separators/noise; fallback to any YYYYMMDD.
+    Parse trading date from filenames like:
+      - CP20250925.dbf  (YYYYMMDD, 8 digits)
+      - CP250925.dbf    (YYMMDD,   6 digits)
+    Returns pandas.Timestamp (date only).
     """
-    base = Path(name).name
-    base_clean = base.replace("-", "").replace("_", "")
-    m = re.search(r'(?i)\bCP(\d{8})\b', base_clean)
-    if m:
-        return pd.Timestamp(datetime.strptime(m.group(1), "%Y%m%d").date())
-    m2 = re.search(r'(\d{4})(\d{2})(\d{2})', base_clean)
-    if m2:
-        return pd.Timestamp(datetime.strptime("".join(m2.groups()), "%Y%m%d").date())
-    raise ValueError(f"Filename '{base}' does not contain a parsable date (expected CPyyyyMMdd).")
+    base = Path(name).name.upper()
+
+    # Prefer exact CP + 8 digits (YYYYMMDD)
+    m8 = re.search(r'CP(\d{8})', base)
+    if m8:
+        return pd.Timestamp(datetime.strptime(m8.group(1), "%Y%m%d").date())
+
+    # Then allow CP + 6 digits (YYMMDD)
+    m6 = re.search(r'CP(\d{6})', base)
+    if m6:
+        # %y interprets 00-68 as 2000-2068, 69-99 as 1969-1999 (Python behavior)
+        # That's okay for modern market data (e.g., 25 -> 2025)
+        return pd.Timestamp(datetime.strptime(m6.group(1), "%y%m%d").date())
+
+    raise ValueError(f"Filename '{base}' does not contain a parsable date (expected CPyymmdd or CPyyyymmdd).")
 
 def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
     """
     Read a DBF (raw bytes) into DataFrame with columns: ['code','close'].
+    Expects exactly 2 columns (order agnostic).
     """
     if not DBF_AVAILABLE:
         raise RuntimeError("dbfread is required. Install with: pip install dbfread")
@@ -84,6 +93,7 @@ def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
     if len(cols) != 2:
         raise ValueError(f"DBF expected 2 columns but found {len(cols)}: {cols}")
 
+    # Heuristic: numeric column is price, non-numeric is code
     c0_is_num = pd.api.types.is_numeric_dtype(df[cols[0]])
     if c0_is_num:
         price_col, code_col = cols[0], cols[1]
@@ -107,11 +117,12 @@ def read_zip_of_dbfs(zip_bytes: bytes):
     """
     results = []
     skipped = []
+
     with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
         members = [
             m for m in z.namelist()
             if m.lower().endswith(".dbf")
-            and "__MACOSX/" not in m
+            and "__macosx/" not in m.lower()
             and not Path(m).name.startswith("._")
         ]
         if not members:
@@ -124,6 +135,7 @@ def read_zip_of_dbfs(zip_bytes: bytes):
             except Exception as e:
                 skipped.append({"member": m, "reason": str(e)})
                 continue
+
             try:
                 with z.open(m) as f:
                     dbf_bytes = f.read()
@@ -131,6 +143,7 @@ def read_zip_of_dbfs(zip_bytes: bytes):
                 results.append((date, df, m))
             except Exception as e:
                 skipped.append({"member": m, "reason": f"Failed to read DBF: {e}"})
+
     return results, skipped
 
 def build_price_matrix(pairs: List[Tuple[pd.Timestamp, pd.DataFrame]]) -> pd.DataFrame:
@@ -193,7 +206,15 @@ def ingest_uploaded_files(uploaded_files) -> Tuple[List[Tuple[pd.Timestamp, pd.D
         name = uf.name
         try:
             if name.lower().endswith(".zip"):
-                triplets, sk = read_zip_of_dbfs(uf.read())
+                contents = uf.read()
+                # Show zip members for debugging
+                with st.expander(f"ZIP members in {name}"):
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(contents), "r") as z:
+                            st.write(z.namelist())
+                    except Exception as e:
+                        st.write(f"(Could not list members: {e})")
+                triplets, sk = read_zip_of_dbfs(contents)
                 pairs.extend([(d, df) for (d, df, _m) in triplets])
                 skipped.extend(sk)
             elif name.lower().endswith(".dbf"):
@@ -231,8 +252,11 @@ with colR:
 st.divider()
 
 if not uploaded_files:
-    st.info("Upload **one or more** `.dbf`/`.zip` files (e.g., `CP20250925.dbf` or `CP_September.zip`).")
+    st.info("Upload `.dbf` and/or `.zip` files (e.g., `CP250925.dbf`, `CP20250925.dbf`).")
     st.stop()
+
+with st.expander("All uploaded filenames"):
+    st.write([f.name for f in uploaded_files])
 
 # ----------------- Processing -----------------
 try:
