@@ -1,17 +1,16 @@
 import io
 import json
 import zipfile
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# -------------- Optional dependency: dbfread --------------
-# We use dbfread for robust DBF parsing.
-# If not installed, show a friendly message.
+# ---- Optional dependency for DBF parsing ----
 try:
     from dbfread import DBF
     DBF_AVAILABLE = True
@@ -19,18 +18,17 @@ except Exception:
     DBF_AVAILABLE = False
 
 st.set_page_config(page_title="DBF → JSON (Daily Close Prices)", layout="wide")
-st.title("📦➡️🧾 DBF (CPyyyymmdd) → JSON Converter")
+st.title("📦➡️🧾 DBF (CPyyyymmdd) → JSON Converter — Multi-file")
 
 st.markdown(
     """
-This app converts your **daily close price** files (DBF) into **JSON**.
+Upload **one or more** files (`.dbf` and/or `.zip` containing `.dbf`).
+The app will parse daily close prices and export **JSON**.
 
-**Assumptions (per your spec):**
-- Each file is named `CPyyyymmdd.dbf` (date from filename)
-- Each file contains **two columns**:  
-  1) stock **code**  
-  2) **closing price**  
-- Files are usually provided in a **.zip** (multiple DBFs).  
+**Assumptions:**
+- Each daily file is named `CPyyyymmdd.dbf` (date from filename)
+- Each DBF contains exactly **two columns**: stock **code**, **close**
+- Codes are normalized (trim + uppercase), prices to numeric
 """
 )
 
@@ -44,29 +42,27 @@ if not DBF_AVAILABLE:
 # ----------------- Helpers -----------------
 def parse_cp_date_from_name(name: str) -> pd.Timestamp:
     """
-    Parse date from filename like 'CP20250925.dbf' (case-insensitive).
-    Returns pandas Timestamp (date only).
+    Robustly parse date from filenames.
+    Preferred: CPyyyyMMdd.*  (e.g., CP20250925.dbf)
+    Also tolerates separators/noise; fallback to any YYYYMMDD.
     """
-    stem = Path(name).stem.upper()
-    if not (stem.startswith("CP") and len(stem) >= 10):
-        raise ValueError(f"Filename '{name}' does not match 'CPyyyymmdd' pattern.")
-    try:
-        dt = datetime.strptime(stem[2:10], "%Y%m%d")
-    except ValueError:
-        raise ValueError(f"Filename '{name}' has invalid date portion.")
-    return pd.Timestamp(dt.date())
+    base = Path(name).name
+    base_clean = base.replace("-", "").replace("_", "")
+    m = re.search(r'(?i)\bCP(\d{8})\b', base_clean)
+    if m:
+        return pd.Timestamp(datetime.strptime(m.group(1), "%Y%m%d").date())
+    m2 = re.search(r'(\d{4})(\d{2})(\d{2})', base_clean)
+    if m2:
+        return pd.Timestamp(datetime.strptime("".join(m2.groups()), "%Y%m%d").date())
+    raise ValueError(f"Filename '{base}' does not contain a parsable date (expected CPyyyyMMdd).")
 
 def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
     """
-    Read a DBF from raw bytes into a DataFrame.
-    Expect exactly two columns: code and close (in any order).
+    Read a DBF (raw bytes) into DataFrame with columns: ['code','close'].
     """
     if not DBF_AVAILABLE:
         raise RuntimeError("dbfread is required. Install with: pip install dbfread")
 
-    # dbfread accepts file-like objects only via temporary workaround:
-    # We write to a BytesIO-backed temporary file-like interface by using DBF on BytesIO
-    # However dbfread expects a filesystem path. So write to a temp file.
     import tempfile, os
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dbf") as tmp:
         tmp.write(dbf_bytes)
@@ -88,7 +84,6 @@ def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
     if len(cols) != 2:
         raise ValueError(f"DBF expected 2 columns but found {len(cols)}: {cols}")
 
-    # Heuristic: numeric column is price, non-numeric is code
     c0_is_num = pd.api.types.is_numeric_dtype(df[cols[0]])
     if c0_is_num:
         price_col, code_col = cols[0], cols[1]
@@ -97,37 +92,50 @@ def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
 
     out = df[[code_col, price_col]].copy()
     out.columns = ["code", "close"]
-    # normalize
     out["code"] = out["code"].astype(str).str.strip().str.upper()
     out["close"] = pd.to_numeric(out["close"], errors="coerce")
     out = out.dropna(subset=["close"])
-    # keep last duplicate code (if present)
     out = out.drop_duplicates(subset=["code"], keep="last").reset_index(drop=True)
     return out
 
-def read_zip_of_dbfs(zip_bytes: bytes) -> List[Tuple[pd.Timestamp, pd.DataFrame, str]]:
+def read_zip_of_dbfs(zip_bytes: bytes):
     """
-    Reads a ZIP (bytes) of DBF files and returns a list of (date, df, member_name).
-    df has columns: code, close
+    Reads a ZIP (bytes) of DBFs.
+    Returns:
+      triplets: List[(date: pd.Timestamp, df: DataFrame(code,close), member_name: str)]
+      skipped:  List[{member: str, reason: str}]
     """
     results = []
+    skipped = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
-        members = [m for m in z.namelist() if m.lower().endswith(".dbf")]
+        members = [
+            m for m in z.namelist()
+            if m.lower().endswith(".dbf")
+            and "__MACOSX/" not in m
+            and not Path(m).name.startswith("._")
+        ]
         if not members:
-            raise ValueError("No .dbf files found inside the ZIP.")
+            skipped.append({"member": "<zip>", "reason": "No .dbf files found in ZIP."})
+            return results, skipped
 
         for m in sorted(members):
-            # parse date from filename
-            date = parse_cp_date_from_name(Path(m).name)
-            with z.open(m) as f:
-                dbf_bytes = f.read()
-            df = read_dbf_bytes(dbf_bytes)
-            results.append((date, df, m))
-    return results
+            try:
+                date = parse_cp_date_from_name(m)
+            except Exception as e:
+                skipped.append({"member": m, "reason": str(e)})
+                continue
+            try:
+                with z.open(m) as f:
+                    dbf_bytes = f.read()
+                df = read_dbf_bytes(dbf_bytes)
+                results.append((date, df, m))
+            except Exception as e:
+                skipped.append({"member": m, "reason": f"Failed to read DBF: {e}"})
+    return results, skipped
 
 def build_price_matrix(pairs: List[Tuple[pd.Timestamp, pd.DataFrame]]) -> pd.DataFrame:
     """
-    Given list of (date, df[code, close]), pivot into wide matrix:
+    Given list of (date, df[code, close]), pivot to wide:
     index=date, columns=code, values=close
     """
     frames = []
@@ -140,25 +148,18 @@ def build_price_matrix(pairs: List[Tuple[pd.Timestamp, pd.DataFrame]]) -> pd.Dat
     if not frames:
         return pd.DataFrame()
     prices = pd.concat(frames, axis=0).sort_index()
-    # enforce numeric
     prices = prices.apply(pd.to_numeric, errors="coerce")
     return prices
 
 def to_json_nested_by_date(prices: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    """
-    { "YYYY-MM-DD": { "CODE": close, ... }, ... }
-    """
     nested = {}
     for d, row in prices.iterrows():
-        # drop nans
-        data = {c: float(v) for c, v in row.dropna().to_dict().items()}
-        nested[str(pd.to_datetime(d).date())] = data
+        nested[str(pd.to_datetime(d).date())] = {
+            c: float(v) for c, v in row.dropna().to_dict().items()
+        }
     return nested
 
 def to_json_records(prices: pd.DataFrame) -> List[Dict[str, object]]:
-    """
-    [ {"date": "YYYY-MM-DD", "code": "XXX", "close": 123.0}, ... ]  (long format)
-    """
     records = []
     for d, row in prices.iterrows():
         date_str = str(pd.to_datetime(d).date())
@@ -167,9 +168,6 @@ def to_json_records(prices: pd.DataFrame) -> List[Dict[str, object]]:
     return records
 
 def to_json_wide(prices: pd.DataFrame) -> Dict[str, object]:
-    """
-    { "meta": {...}, "data": [ {"date":"YYYY-MM-DD", "BBCA":..., "TLKM":...}, ... ] }
-    """
     data_rows = prices.copy()
     data_rows.insert(0, "date", data_rows.index.date.astype(str))
     data_rows = data_rows.reset_index(drop=True)
@@ -182,11 +180,45 @@ def to_json_wide(prices: pd.DataFrame) -> Dict[str, object]:
         "data": data_rows.to_dict(orient="records")
     }
 
-# ----------------- UI: upload & options -----------------
-colL, colR = st.columns([2, 1])
+def ingest_uploaded_files(uploaded_files) -> Tuple[List[Tuple[pd.Timestamp, pd.DataFrame]], List[Dict[str, str]]]:
+    """
+    Accepts a list of UploadedFile objects (.dbf or .zip).
+    Returns:
+      pairs:   List[(date, df(code,close))]
+      skipped: List[{member: str, reason: str}]
+    """
+    pairs = []
+    skipped = []
+    for uf in uploaded_files:
+        name = uf.name
+        try:
+            if name.lower().endswith(".zip"):
+                triplets, sk = read_zip_of_dbfs(uf.read())
+                pairs.extend([(d, df) for (d, df, _m) in triplets])
+                skipped.extend(sk)
+            elif name.lower().endswith(".dbf"):
+                # single DBF (one day)
+                try:
+                    date = parse_cp_date_from_name(name)
+                except Exception as e:
+                    skipped.append({"member": name, "reason": str(e)})
+                    continue
+                df = read_dbf_bytes(uf.read())
+                pairs.append((date, df))
+            else:
+                skipped.append({"member": name, "reason": "Unsupported file type (use .dbf or .zip)."})
+        except Exception as e:
+            skipped.append({"member": name, "reason": f"Failed to process: {e}"})
+    return pairs, skipped
 
+# ----------------- UI -----------------
+colL, colR = st.columns([2, 1])
 with colL:
-    uploaded = st.file_uploader("Upload a ZIP of DBFs (or a single .dbf)", type=["zip", "dbf"])
+    uploaded_files = st.file_uploader(
+        "Upload one or more files (.zip and/or .dbf)",
+        type=["zip", "dbf"],
+        accept_multiple_files=True
+    )
 with colR:
     layout = st.selectbox(
         "JSON layout",
@@ -198,54 +230,51 @@ with colR:
 
 st.divider()
 
-if uploaded is None:
-    st.info("Choose a **.zip** containing files like `CP20250925.dbf` (or a single `.dbf`).")
+if not uploaded_files:
+    st.info("Upload **one or more** `.dbf`/`.zip` files (e.g., `CP20250925.dbf` or `CP_September.zip`).")
     st.stop()
 
 # ----------------- Processing -----------------
 try:
-    pairs: List[Tuple[pd.Timestamp, pd.DataFrame]] = []
-
-    if uploaded.name.lower().endswith(".zip"):
-        # multiple days
-        contents = uploaded.read()
-        triplets = read_zip_of_dbfs(contents)  # (date, df, member_name)
-        # show quick summary
-        st.success(f"Found {len(triplets)} DBF file(s) in the ZIP.")
-        with st.expander("Files detected"):
-            st.write(pd.DataFrame(
-                [{"member": m, "date": str(d.date()), "rows": len(df)} for (d, df, m) in triplets]
-            ))
-        pairs = [(d, df) for (d, df, _) in triplets]
-
-    else:
-        # single day
-        # Parse date from the single DBF filename
-        date = parse_cp_date_from_name(uploaded.name)
-        df = read_dbf_bytes(uploaded.read())
-        pairs = [(date, df)]
-        st.success(f"Read {uploaded.name} with {len(df)} rows for date {str(date.date())}.")
+    pairs, skipped = ingest_uploaded_files(uploaded_files)
+    if not pairs and skipped:
+        st.error("No valid DBFs found in the uploaded files.")
+        with st.expander("Skipped files / reasons"):
+            st.write(pd.DataFrame(skipped))
+        st.stop()
 
     # Build price matrix
     prices = build_price_matrix(pairs)
     if prices.empty:
         st.error("No data parsed from the provided file(s).")
+        if skipped:
+            with st.expander("Skipped files / reasons"):
+                st.write(pd.DataFrame(skipped))
         st.stop()
 
-    # Optionally drop entirely empty columns (all-NaN)
+    # Optionally drop empty columns
     if drop_empty_cols:
         prices = prices.dropna(axis=1, how="all")
 
-    # Summary block
+    # Summary
     n_days = prices.shape[0]
     n_codes = prices.shape[1]
     date_min = str(prices.index.min().date())
     date_max = str(prices.index.max().date())
 
-    met1, met2, met3 = st.columns(3)
-    met1.metric("Trading days", f"{n_days}")
-    met2.metric("Unique codes", f"{n_codes}")
-    met3.metric("Date range", f"{date_min} → {date_max}")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Trading days", f"{n_days}")
+    m2.metric("Unique codes", f"{n_codes}")
+    m3.metric("Date range", f"{date_min} → {date_max}")
+
+    with st.expander("Files processed (by date)"):
+        st.write(pd.DataFrame(
+            [{"date": str(d.date()), "rows": len(df)} for (d, df) in pairs]
+        ).sort_values("date"))
+
+    if skipped:
+        with st.expander("Skipped files / reasons"):
+            st.write(pd.DataFrame(skipped))
 
     with st.expander("Preview (tail) of wide price table"):
         st.dataframe(prices.tail())
@@ -262,7 +291,6 @@ try:
         default_name = f"close_prices_wide_{date_min}_{date_max}.json"
 
     json_bytes = json.dumps(json_obj, indent=indent, ensure_ascii=False).encode("utf-8")
-
     st.download_button(
         label="⬇️ Download JSON",
         data=json_bytes,
@@ -271,7 +299,7 @@ try:
         use_container_width=True
     )
 
-    st.success("JSON is ready. Use the preview above to validate a few rows before exporting.")
+    st.success("JSON is ready.")
 except Exception as e:
     st.error(f"Error: {e}")
     st.exception(e)
