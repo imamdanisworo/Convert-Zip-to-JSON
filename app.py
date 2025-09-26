@@ -1,4 +1,4 @@
-# app.py — DBF→JSON Converter (CPyyyymmdd / CPyymmdd), multi-file, robust parsing
+# app.py — DBF → JSON (daily close), multi-file, robust parsing, code-length filter
 import io
 import json
 import re
@@ -25,7 +25,7 @@ st.title("📦➡️🧾 DBF (CPyyyymmdd / CPyymmdd) → JSON Converter")
 st.markdown(
     """
 Upload **one or more** `.dbf` files and/or `.zip` files that contain `.dbf`.
-The app will parse your **daily closing prices** and export **JSON**.
+The app parses your **daily closing prices** and exports **JSON**.
 
 **Assumptions:**
 - Filenames are `CPyyyymmdd.dbf` **or** `CPyymmdd.dbf` (date from filename)
@@ -138,7 +138,7 @@ def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
         price_series = col1_num
         code_series = df[c0].map(_clean_code)
     else:
-        # tie-breaker: try raw numeric coercion as hint
+        # tie-breaker: try raw numeric coercion as a hint
         t0 = pd.to_numeric(df[c0], errors="coerce").notna().sum()
         t1 = pd.to_numeric(df[c1], errors="coerce").notna().sum()
         if t0 >= t1:
@@ -347,7 +347,13 @@ try:
         fname = f"close_prices_wide_{date_min}_{date_max}.json"
 
     json_bytes = json.dumps(json_obj, indent=indent, ensure_ascii=False).encode("utf-8")
-    st.download_button("⬇️ Download JSON", data=json_bytes, file_name=fn ame, mime="application/json", use_container_width=True)
+    st.download_button(
+        "⬇️ Download JSON",
+        data=json_bytes,
+        file_name=fname,
+        mime="application/json",
+        use_container_width=True
+    )
 
     st.success("JSON is ready.")
 except Exception as e:
