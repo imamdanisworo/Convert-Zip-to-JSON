@@ -5,7 +5,7 @@ import re
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -44,12 +44,18 @@ if not DBF_AVAILABLE:
 
 # ------------------------ Helpers ------------------------
 def parse_cp_date_from_name(name: str) -> pd.Timestamp:
+    """
+    Parse trading date from filenames like:
+      - CP20250925.dbf  (YYYYMMDD, 8 digits)
+      - CP250925.dbf    (YYMMDD,   6 digits)
+    Returns pandas.Timestamp (date only).
+    """
     base = Path(name).name.upper()
     m8 = re.search(r'CP(\d{8})', base)
     if m8:  # YYYYMMDD
         return pd.Timestamp(datetime.strptime(m8.group(1), "%Y%m%d").date())
     m6 = re.search(r'CP(\d{6})', base)
-    if m6:  # YYMMDD
+    if m6:  # YYMMDD (Python %y: 00–68 => 2000–2068; 69–99 => 1969–1999)
         return pd.Timestamp(datetime.strptime(m6.group(1), "%y%m%d").date())
     raise ValueError("No CPyymmdd/CPyyyymmdd date pattern found")
 
@@ -59,25 +65,38 @@ def _clean_code(v) -> str:
     return str(v).replace("\x00", "").strip().upper()
 
 def _clean_close(v):
-    import re, ast
+    """
+    Convert DBF field to float, tolerating:
+    - real bytes (b'...')
+    - byte-literal strings ("b'...\\x00'")
+    - thousand separators, NULs, parentheses-negatives
+    - stray non-numeric characters
+    """
+    import ast
     from decimal import Decimal
 
     if v is None:
         return np.nan
+
+    # Fast path for numerics
     if isinstance(v, (int, float, np.number)):
         return float(v)
     if isinstance(v, Decimal):
         return float(v)
+
+    # Decode true bytes/bytearray
     if isinstance(v, (bytes, bytearray)):
         try:
             v = bytes(v).decode("latin-1", errors="ignore")
         except Exception:
-            v = str(bytes(v))
+            v = str(bytes(v))  # fallback to repr-like string
+
+    # Handle "byte-literal strings" e.g., "b'6875.00\\x00...'"
     if isinstance(v, str):
         s0 = v.strip()
         if re.match(r"""^b(['"]).*\1$""", s0):
             try:
-                lit = ast.literal_eval(s0)
+                lit = ast.literal_eval(s0)  # -> bytes
                 if isinstance(lit, (bytes, bytearray)):
                     v = lit.decode("latin-1", errors="ignore")
                 else:
@@ -86,12 +105,21 @@ def _clean_close(v):
                 v = s0
         else:
             v = s0
+
+    # Now v should be a plain string
     s = str(v)
+
+    # Remember parentheses-negatives, e.g., "(1,234.56)"
     neg = "(" in s and ")" in s
+
+    # Strip NULs and commas
     s = s.replace("\x00", "").replace(",", "").strip()
+
+    # Keep only digits, dot, minus
     s = re.sub(r"[^0-9\.\-]", "", s)
     if s in ("", ".", "-", "-."):
         return np.nan
+
     try:
         val = float(s)
         if neg and val > 0:
@@ -101,6 +129,10 @@ def _clean_close(v):
         return np.nan
 
 def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
+    """
+    Read a DBF (raw bytes) into DataFrame with columns ['code','close'].
+    Detect which of the two columns is price by numeric success rate after cleaning.
+    """
     if not DBF_AVAILABLE:
         raise RuntimeError("dbfread is required. Install with: pip install dbfread")
 
@@ -108,6 +140,7 @@ def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dbf") as tmp:
         tmp.write(dbf_bytes)
         tmp_path = tmp.name
+
     try:
         rows = list(DBF(tmp_path, load=True, ignore_missing_memofile=True))
     finally:
@@ -115,17 +148,21 @@ def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
             os.remove(tmp_path)
         except Exception:
             pass
+
     if not rows:
         return pd.DataFrame(columns=["code", "close"])
+
     df = pd.DataFrame(rows)
     cols = df.columns.tolist()
     if len(cols) != 2:
         raise ValueError(f"Expected 2 columns, found {len(cols)}: {cols}")
+
     c0, c1 = cols[0], cols[1]
     col0_num = df[c0].map(_clean_close)
     col1_num = df[c1].map(_clean_close)
     c0_valid = col0_num.notna().sum()
     c1_valid = col1_num.notna().sum()
+
     if c0_valid > c1_valid:
         price_series = col0_num
         code_series = df[c1].map(_clean_code)
@@ -133,24 +170,36 @@ def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
         price_series = col1_num
         code_series = df[c0].map(_clean_code)
     else:
+        # tie-breaker: try raw numeric coercion as a hint
         t0 = pd.to_numeric(df[c0], errors="coerce").notna().sum()
         t1 = pd.to_numeric(df[c1], errors="coerce").notna().sum()
         if t0 >= t1:
             price_series = col0_num; code_series = df[c1].map(_clean_code)
         else:
             price_series = col1_num; code_series = df[c0].map(_clean_code)
+
     out = pd.DataFrame({"code": code_series, "close": price_series}).dropna(subset=["close"])
+    # Deduplicate codes per file (keep last)
     return out.drop_duplicates(subset=["code"], keep="last").reset_index(drop=True)
 
 def read_zip_of_dbfs(zip_bytes: bytes):
+    """
+    Read a ZIP (bytes) of DBFs.
+    Returns (triplets, skipped) where:
+      - triplets: [(date: Timestamp, df(code,close): DataFrame, member_name: str), ...]
+      - skipped:  [{"member": str, "reason": str}, ...]
+    """
     results, skipped = [], []
     with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as z:
         members = [
             m for m in z.namelist()
-            if m.lower().endswith(".dbf") and "__macosx/" not in m.lower() and not Path(m).name.startswith("._")
+            if m.lower().endswith(".dbf")
+            and "__macosx/" not in m.lower()
+            and not Path(m).name.startswith("._")
         ]
         if not members:
             return results, [{"member": "<zip>", "reason": "No .dbf files in ZIP"}]
+
         for m in sorted(members):
             try:
                 date = parse_cp_date_from_name(m)
@@ -166,7 +215,13 @@ def read_zip_of_dbfs(zip_bytes: bytes):
                 skipped.append({"member": m, "reason": f"DBF read error: {e}"})
     return results, skipped
 
-def ingest_uploaded_files(uploaded_files):
+def ingest_uploaded_files(uploaded_files) -> Tuple[List[Tuple[pd.Timestamp, pd.DataFrame]], List[Dict[str, str]]]:
+    """
+    Accept many UploadedFile objects (.dbf or .zip).
+    Returns:
+      pairs:   [(date, df(code,close)), ...]
+      skipped: [{"member": str, "reason": str}, ...]
+    """
     pairs, skipped = [], []
     for uf in uploaded_files:
         name = uf.name
@@ -189,32 +244,53 @@ def ingest_uploaded_files(uploaded_files):
             skipped.append({"member": name, "reason": f"Processing error: {e}"})
     return pairs, skipped
 
-def build_price_matrix(pairs):
+def build_price_matrix(pairs: List[Tuple[pd.Timestamp, pd.DataFrame]]) -> pd.DataFrame:
+    """
+    Pivot (date, df[code,close]) pairs to wide matrix: index=date, columns=code, values=close.
+    Ensures we create a 1-row DataFrame per date (not a Series), so setting index works.
+    """
     if not pairs:
         return pd.DataFrame()
+
     frames = []
     for date, df in pairs:
         if df.empty:
             continue
-        w = df.set_index("code")["close"].T
-        w.index = [date]
+        # keep last in case duplicates within a file
+        dfc = df.drop_duplicates(subset=["code"], keep="last").set_index("code")
+        # IMPORTANT: use double brackets to keep DataFrame, then transpose to a 1-row DataFrame
+        w = dfc[["close"]].T
+        w.index = [pd.to_datetime(date)]
         frames.append(w)
+
     if not frames:
         return pd.DataFrame()
-    prices = pd.concat(frames, axis=0).sort_index()
-    return prices.apply(pd.to_numeric, errors="coerce")
 
-def filter_stock_codes(prices, min_len: int = 4, max_len: int = 7):
+    prices = pd.concat(frames, axis=0).sort_index()
+    # coerce values to numeric
+    prices = prices.apply(pd.to_numeric, errors="coerce")
+    return prices
+
+def filter_stock_codes(prices: pd.DataFrame, min_len: int = 4, max_len: int = 7) -> pd.DataFrame:
+    """
+    Keep only stock codes whose name length is between min_len and max_len.
+    """
     valid_cols = [c for c in prices.columns if min_len <= len(str(c)) <= max_len]
     return prices[valid_cols]
 
-def to_json_nested_by_date(prices):
+def to_json_nested_by_date(prices: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    { "YYYY-MM-DD": { "CODE": close, ... }, ... }
+    """
     nested = {}
     for d, row in prices.iterrows():
         nested[str(pd.to_datetime(d).date())] = {c: float(v) for c, v in row.dropna().to_dict().items()}
     return nested
 
-def to_json_records(prices):
+def to_json_records(prices: pd.DataFrame) -> List[Dict[str, object]]:
+    """
+    [ {"date":"YYYY-MM-DD","code":"XXX","close":123.0}, ... ]
+    """
     records = []
     for d, row in prices.iterrows():
         ds = str(pd.to_datetime(d).date())
@@ -222,13 +298,19 @@ def to_json_records(prices):
             records.append({"date": ds, "code": code, "close": float(val)})
     return records
 
-def to_json_wide(prices):
+def to_json_wide(prices: pd.DataFrame) -> Dict[str, object]:
+    """
+    { "meta": {...}, "data": [ {"date":"YYYY-MM-DD", "BBCA":..., ...}, ... ] }
+    """
     data_rows = prices.copy()
     data_rows.insert(0, "date", data_rows.index.date.astype(str))
     data_rows = data_rows.reset_index(drop=True)
     return {
-        "meta": {"index": "date", "columns": list(prices.columns),
-                 "notes": "Rows are dates; columns are stock codes; values are closing prices."},
+        "meta": {
+            "index": "date",
+            "columns": list(prices.columns),
+            "notes": "Rows are dates; columns are stock codes; values are closing prices."
+        },
         "data": data_rows.to_dict(orient="records")
     }
 
@@ -241,7 +323,11 @@ with colL:
         accept_multiple_files=True
     )
 with colR:
-    layout = st.selectbox("JSON layout", ["Nested by date (default)", "Row records (long)", "Wide table with meta"], index=0)
+    layout = st.selectbox(
+        "JSON layout",
+        ["Nested by date (default)", "Row records (long)", "Wide table with meta"],
+        index=0
+    )
     indent = st.number_input("JSON indent", min_value=0, max_value=8, value=2, step=1)
     drop_empty_cols = st.checkbox("Drop columns that are entirely empty", value=True)
 
@@ -274,8 +360,10 @@ try:
     if drop_empty_cols:
         prices = prices.dropna(axis=1, how="all")
 
+    # Filter codes to length 4–7 (your requirement)
     prices = filter_stock_codes(prices, min_len=4, max_len=7)
 
+    # Summary
     n_days, n_codes = prices.shape
     date_min = str(prices.index.min().date())
     date_max = str(prices.index.max().date())
@@ -295,6 +383,7 @@ try:
     with st.expander("Preview (tail) of wide price table"):
         st.dataframe(prices.tail())
 
+    # Build JSON
     if layout.startswith("Nested by date"):
         json_obj = to_json_nested_by_date(prices)
         fname = f"close_prices_nested_{date_min}_{date_max}.json"
