@@ -1,4 +1,5 @@
-# app.py — DBF → JSON (daily close), multi-file, robust parsing, code-length filter
+# app.py — DBF → JSON (daily close), multi-file, robust parsing
+# Exports BOTH a combined JSON and a ZIP of per-day JSON files.
 import io
 import json
 import re
@@ -31,7 +32,7 @@ The app parses your **daily closing prices** and exports **JSON**.
 - Filenames are `CPyyyymmdd.dbf` **or** `CPyymmdd.dbf` (date from filename)
 - Each DBF has exactly **two columns**: stock **code**, **close**
 - Codes are normalized (trim + uppercase)
-- JSON will include only codes with **length 4–7**
+- Only codes with **length 4–7** are kept in the JSON
 """
 )
 
@@ -77,8 +78,6 @@ def _clean_close(v):
 
     if v is None:
         return np.nan
-
-    # Fast path for numerics
     if isinstance(v, (int, float, np.number)):
         return float(v)
     if isinstance(v, Decimal):
@@ -106,17 +105,10 @@ def _clean_close(v):
         else:
             v = s0
 
-    # Now v should be a plain string
     s = str(v)
-
-    # Remember parentheses-negatives, e.g., "(1,234.56)"
     neg = "(" in s and ")" in s
-
-    # Strip NULs and commas
     s = s.replace("\x00", "").replace(",", "").strip()
-
-    # Keep only digits, dot, minus
-    s = re.sub(r"[^0-9\.\-]", "", s)
+    s = re.sub(r"[^0-9\.\-]", "", s)  # keep only digits/dot/minus
     if s in ("", ".", "-", "-."):
         return np.nan
 
@@ -170,7 +162,7 @@ def read_dbf_bytes(dbf_bytes: bytes) -> pd.DataFrame:
         price_series = col1_num
         code_series = df[c0].map(_clean_code)
     else:
-        # tie-breaker: try raw numeric coercion as a hint
+        # tie-breaker: raw numeric coercion as hint
         t0 = pd.to_numeric(df[c0], errors="coerce").notna().sum()
         t1 = pd.to_numeric(df[c1], errors="coerce").notna().sum()
         if t0 >= t1:
@@ -247,7 +239,7 @@ def ingest_uploaded_files(uploaded_files) -> Tuple[List[Tuple[pd.Timestamp, pd.D
 def build_price_matrix(pairs: List[Tuple[pd.Timestamp, pd.DataFrame]]) -> pd.DataFrame:
     """
     Pivot (date, df[code,close]) pairs to wide matrix: index=date, columns=code, values=close.
-    Ensures we create a 1-row DataFrame per date (not a Series), so setting index works.
+    Ensures a 1-row DataFrame per date so setting index works.
     """
     if not pairs:
         return pd.DataFrame()
@@ -256,9 +248,7 @@ def build_price_matrix(pairs: List[Tuple[pd.Timestamp, pd.DataFrame]]) -> pd.Dat
     for date, df in pairs:
         if df.empty:
             continue
-        # keep last in case duplicates within a file
         dfc = df.drop_duplicates(subset=["code"], keep="last").set_index("code")
-        # IMPORTANT: use double brackets to keep DataFrame, then transpose to a 1-row DataFrame
         w = dfc[["close"]].T
         w.index = [pd.to_datetime(date)]
         frames.append(w)
@@ -267,30 +257,19 @@ def build_price_matrix(pairs: List[Tuple[pd.Timestamp, pd.DataFrame]]) -> pd.Dat
         return pd.DataFrame()
 
     prices = pd.concat(frames, axis=0).sort_index()
-    # coerce values to numeric
-    prices = prices.apply(pd.to_numeric, errors="coerce")
-    return prices
+    return prices.apply(pd.to_numeric, errors="coerce")
 
 def filter_stock_codes(prices: pd.DataFrame, min_len: int = 4, max_len: int = 7) -> pd.DataFrame:
-    """
-    Keep only stock codes whose name length is between min_len and max_len.
-    """
     valid_cols = [c for c in prices.columns if min_len <= len(str(c)) <= max_len]
     return prices[valid_cols]
 
 def to_json_nested_by_date(prices: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    """
-    { "YYYY-MM-DD": { "CODE": close, ... }, ... }
-    """
     nested = {}
     for d, row in prices.iterrows():
         nested[str(pd.to_datetime(d).date())] = {c: float(v) for c, v in row.dropna().to_dict().items()}
     return nested
 
 def to_json_records(prices: pd.DataFrame) -> List[Dict[str, object]]:
-    """
-    [ {"date":"YYYY-MM-DD","code":"XXX","close":123.0}, ... ]
-    """
     records = []
     for d, row in prices.iterrows():
         ds = str(pd.to_datetime(d).date())
@@ -299,20 +278,42 @@ def to_json_records(prices: pd.DataFrame) -> List[Dict[str, object]]:
     return records
 
 def to_json_wide(prices: pd.DataFrame) -> Dict[str, object]:
-    """
-    { "meta": {...}, "data": [ {"date":"YYYY-MM-DD", "BBCA":..., ...}, ... ] }
-    """
     data_rows = prices.copy()
     data_rows.insert(0, "date", data_rows.index.date.astype(str))
     data_rows = data_rows.reset_index(drop=True)
     return {
-        "meta": {
-            "index": "date",
-            "columns": list(prices.columns),
-            "notes": "Rows are dates; columns are stock codes; values are closing prices."
-        },
+        "meta": {"index": "date", "columns": list(prices.columns),
+                 "notes": "Rows are dates; columns are stock codes; values are closing prices."},
         "data": data_rows.to_dict(orient="records")
     }
+
+def filter_codes_in_df(df: pd.DataFrame, min_len=4, max_len=7) -> pd.DataFrame:
+    """Filter a 2-col df(code, close) to code length range."""
+    df = df.copy()
+    df["code"] = df["code"].astype(str)
+    mask = df["code"].map(lambda c: min_len <= len(c) <= max_len)
+    return df[mask]
+
+def make_per_day_json_zip(pairs: List[Tuple[pd.Timestamp, pd.DataFrame]], indent: int = 2) -> bytes:
+    """
+    Build a ZIP in memory with one JSON per date:
+      close_YYYY-MM-DD.json → { "CODE": close, ... }   (after code-length filtering)
+    """
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+        for date, df in pairs:
+            if df.empty:
+                continue
+            df_day = filter_codes_in_df(df, 4, 7)
+            if df_day.empty:
+                continue
+            payload = {row["code"]: float(row["close"]) for _, row in df_day.dropna(subset=["close"]).iterrows()}
+            if not payload:
+                continue
+            date_str = str(pd.to_datetime(date).date())
+            z.writestr(f"close_{date_str}.json", json.dumps(payload, indent=indent, ensure_ascii=False))
+    mem.seek(0)
+    return mem.read()
 
 # ------------------------ UI Controls ------------------------
 colL, colR = st.columns([2, 1])
@@ -323,13 +324,9 @@ with colL:
         accept_multiple_files=True
     )
 with colR:
-    layout = st.selectbox(
-        "JSON layout",
-        ["Nested by date (default)", "Row records (long)", "Wide table with meta"],
-        index=0
-    )
+    layout = st.selectbox("Combined JSON layout", ["Nested by date (default)", "Row records (long)", "Wide table with meta"], index=0)
     indent = st.number_input("JSON indent", min_value=0, max_value=8, value=2, step=1)
-    drop_empty_cols = st.checkbox("Drop columns that are entirely empty", value=True)
+    drop_empty_cols = st.checkbox("Drop columns that are entirely empty (combined view)", value=True)
 
 st.divider()
 
@@ -349,6 +346,7 @@ try:
             st.write(pd.DataFrame(skipped))
         st.stop()
 
+    # --- Build combined wide price table ---
     prices = build_price_matrix(pairs)
     if prices.empty:
         st.error("No data parsed from the provided file(s).")
@@ -360,7 +358,7 @@ try:
     if drop_empty_cols:
         prices = prices.dropna(axis=1, how="all")
 
-    # Filter codes to length 4–7 (your requirement)
+    # filter codes 4–7 for combined JSON/table
     prices = filter_stock_codes(prices, min_len=4, max_len=7)
 
     # Summary
@@ -380,10 +378,10 @@ try:
         with st.expander("Skipped files / reasons"):
             st.write(pd.DataFrame(skipped))
 
-    with st.expander("Preview (tail) of wide price table"):
+    with st.expander("Preview (tail) of wide price table (combined)"):
         st.dataframe(prices.tail())
 
-    # Build JSON
+    # --- Combined JSON (single file) ---
     if layout.startswith("Nested by date"):
         json_obj = to_json_nested_by_date(prices)
         fname = f"close_prices_nested_{date_min}_{date_max}.json"
@@ -396,14 +394,24 @@ try:
 
     json_bytes = json.dumps(json_obj, indent=indent, ensure_ascii=False).encode("utf-8")
     st.download_button(
-        "⬇️ Download JSON",
+        "⬇️ Download COMBINED JSON",
         data=json_bytes,
         file_name=fname,
         mime="application/json",
         use_container_width=True
     )
 
-    st.success("JSON is ready.")
+    # --- Per-day JSON (one file per DBF/day) packed into a ZIP ---
+    zip_bytes = make_per_day_json_zip(pairs, indent=indent)
+    st.download_button(
+        "⬇️ Download PER-DAY JSONs (ZIP)",
+        data=zip_bytes,
+        file_name=f"close_prices_per_day_{date_min}_{date_max}.zip",
+        mime="application/zip",
+        use_container_width=True
+    )
+
+    st.success("JSONs are ready.")
 except Exception as e:
     st.error(f"Error: {e}")
     st.exception(e)
